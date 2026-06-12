@@ -2641,7 +2641,7 @@ async function callAPI(userPrompt, systemPrompt, useSearch = true, phase = 'dna'
   const max_tokens = TOKEN_BUDGETS[phase] || 2000;
 
   const body = {
-    model:      'claude-sonnet-4-20250514',
+    model:      'claude-sonnet-4-6',
     max_tokens,
     messages:   [{ role: 'user', content: userPrompt }]
   };
@@ -2661,8 +2661,10 @@ async function callAPI(userPrompt, systemPrompt, useSearch = true, phase = 'dna'
 
   const data = await res.json();
   if (data.error) throw new Error(data.error);
-
-  return data.content.filter(i => i.type === 'text').map(i => i.text).join('\n');
+  if (!data.content || !Array.isArray(data.content)) throw new Error('Empty response from API');
+  const text = data.content.filter(i => i.type === 'text').map(i => i.text).join('\n');
+  if (!text) throw new Error('No text content in API response');
+  return text;
 }
 
 // ── PHASE 1: SEARCH PROMPTS ───────────────────────────────────
@@ -4172,7 +4174,7 @@ function renderPhase4(tc, evo, teamA, teamB, stage) {
           </div>
           <div class="p3-metric">
             <div class="p3-metric-label">Total Corners Now</div>
-            <div class="p3-metric-val" style="color:var(--accent);">${computeRunningTotal(tc, evo)}</div>
+            <div class="p3-metric-val" style="color:var(--accent);">${(()=>{ let b=state.sampleTrap?.combinedProjection?.adjustedTotalCorners||(( state.dnaProfiles?.teamA?.cornersDNA?.avgFor??5.0)+(state.dnaProfiles?.teamB?.cornersDNA?.avgFor??5.0)); return (b+(tc?.netContextEffect?.cornersAdjustment??0)+(evo?.combinedEvolution?.evolutionCornersAdjustment??0)).toFixed(1); })()}</div>
             <div class="p3-metric-sub">after all P4 adjustments</div>
           </div>
         </div>
@@ -7372,8 +7374,7 @@ async function runFullAnalysis() {
   addLog(`━━ PHASES 1–9 COMPLETE ━━`, 'final');
   addLog(`FINAL VERDICT: ${ultimateVerdict} | Confidence: ${certainty?.finalVerdict?.verdictConfidence ?? '?'}% | No-bet rules fired: ${noBet?.rulesFired ?? 0}`, 'final');
 
-  btn.disabled = false;
-  btn.textContent = 'RE-RUN ANALYSIS';
+  // Button re-enabled after Phase 10 completes
 }
 
 // ── UTILITY ──────────────────────────────────────────────────
@@ -8072,8 +8073,6 @@ function renderTrackerModal(results) {
 
 // ── INTEGRATE PHASE 10 INTO ORCHESTRATOR ─────────────────────
 // Hook into the end of runFullAnalysis — override the final section
-const _originalRunBtn = document.getElementById('runBtn');
-
 // Patch the orchestrator's final steps to include Phase 10
 const _phase10Patch = async function(teamA, teamB, stage) {
   // ── PHASE 10: ADAPTIVE LEARNING ENGINE ───────────────────────
@@ -8114,6 +8113,10 @@ const _phase10Patch = async function(teamA, teamB, stage) {
   setStatus('ALL 10 PHASES COMPLETE', 'var(--accent4)');
   addLog('━━ ALL 10 PHASES COMPLETE ━━', 'learn');
   addLog(`Adaptive learning: ${(learningData.results||[]).length} historical results | Win rate: ${learningData.stats?.accuracyPct ?? 'N/A'}% | Avg error: ±${learningData.stats?.avgError ?? 'N/A'} corners`, 'learn');
+
+  // Re-enable run button now that all 10 phases are truly done
+  const _btn = document.getElementById('runBtn');
+  if (_btn) { _btn.disabled = false; _btn.textContent = 'RE-RUN ANALYSIS'; }
 };
 
 // ── WRAP runFullAnalysis TO INCLUDE PHASE 10 ─────────────────
