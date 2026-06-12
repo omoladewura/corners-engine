@@ -1,22 +1,18 @@
 /**
  * CORNERS ENGINE — CLOUDFLARE WORKER
  * ====================================
- * Handles two responsibilities:
- *   1. Proxies all Anthropic API calls (keeps API key server-side)
- *   2. Manages KV storage for the Adaptive Learning results tracker
- *
  * Routes:
- *   POST /api/chat        → Anthropic API proxy
- *   GET  /api/results     → Load all results from KV
- *   POST /api/results     → Save a new result to KV
- *   DELETE /api/results/:id → Delete a result from KV
- *   DELETE /api/results   → Clear all results from KV
+ *   POST /api/chat          → Anthropic API proxy
+ *   GET  /api/results       → Load all results from KV
+ *   POST /api/results       → Save a new result to KV
+ *   DELETE /api/results/:id → Delete a result by ID
+ *   DELETE /api/results     → Clear all results
+ *   *                       → Serve static assets
  */
 
 const ANTHROPIC_API  = 'https://api.anthropic.com/v1/messages';
 const RESULTS_KV_KEY = 'corners:results:v1';
 
-// ── CORS HEADERS ─────────────────────────────────────────────
 const CORS = {
   'Access-Control-Allow-Origin':  '*',
   'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
@@ -34,7 +30,6 @@ function err(msg, status = 400) {
   return json({ error: msg }, status);
 }
 
-// ── MAIN HANDLER ─────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const url    = new URL(request.url);
@@ -42,29 +37,29 @@ export default {
 
     // Preflight
     if (method === 'OPTIONS') {
-      return new Response(null, { headers: CORS });
+      return new Response(null, { status: 204, headers: CORS });
     }
 
-    // ── Route: Anthropic API proxy ────────────────────────────
+    // ── API: Anthropic proxy ──────────────────────────────────
     if (url.pathname === '/api/chat' && method === 'POST') {
       return handleChat(request, env);
     }
 
-    // ── Route: Results CRUD ───────────────────────────────────
+    // ── API: Results CRUD ─────────────────────────────────────
     if (url.pathname === '/api/results') {
       if (method === 'GET')    return handleLoadResults(env);
       if (method === 'POST')   return handleSaveResult(request, env);
       if (method === 'DELETE') return handleClearResults(env);
     }
 
-    // DELETE /api/results/:id
     const deleteMatch = url.pathname.match(/^\/api\/results\/(\d+)$/);
     if (deleteMatch && method === 'DELETE') {
       return handleDeleteResult(parseInt(deleteMatch[1]), env);
     }
 
-    // ── Serve the app HTML ────────────────────────────────────
-    if (url.pathname === '/' || url.pathname === '/index.html') {
+    // ── Static assets (index.html etc.) ──────────────────────
+    // Pass everything else to Cloudflare Assets
+    if (env.ASSETS) {
       return env.ASSETS.fetch(request);
     }
 
@@ -74,6 +69,10 @@ export default {
 
 // ── ANTHROPIC PROXY ──────────────────────────────────────────
 async function handleChat(request, env) {
+  if (!env.ANTHROPIC_API_KEY) {
+    return err('ANTHROPIC_API_KEY secret not configured', 500);
+  }
+
   let body;
   try {
     body = await request.json();
@@ -81,20 +80,29 @@ async function handleChat(request, env) {
     return err('Invalid JSON body');
   }
 
-  // Validate required fields
   if (!body.messages || !Array.isArray(body.messages)) {
     return err('messages array required');
   }
 
-  // Build the Anthropic request — enforce safe token limits
+  // Always use a valid current model; reject unknown model strings
+  const ALLOWED_MODELS = [
+    'claude-sonnet-4-6',
+    'claude-opus-4-6',
+    'claude-haiku-4-5-20251001',
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+  ];
+  const model = ALLOWED_MODELS.includes(body.model)
+    ? body.model
+    : 'claude-sonnet-4-6';
+
   const anthropicBody = {
-    model:      body.model      || 'claude-sonnet-4-6',
-    max_tokens: Math.min(body.max_tokens || 3000, 4096), // cap at 4096
+    model,
+    max_tokens: Math.min(body.max_tokens || 3000, 4096),
     messages:   body.messages,
   };
-
-  if (body.system)  anthropicBody.system = body.system;
-  if (body.tools)   anthropicBody.tools  = body.tools;
+  if (body.system) anthropicBody.system = body.system;
+  if (body.tools)  anthropicBody.tools  = body.tools;
 
   try {
     const upstream = await fetch(ANTHROPIC_API, {
@@ -103,6 +111,7 @@ async function handleChat(request, env) {
         'Content-Type':      'application/json',
         'x-api-key':         env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
+        'anthropic-beta':    'web-search-2025-03-05',
       },
       body: JSON.stringify(anthropicBody),
     });
@@ -110,24 +119,24 @@ async function handleChat(request, env) {
     const data = await upstream.json();
 
     if (!upstream.ok) {
-      console.error('Anthropic error:', data);
+      console.error('Anthropic error:', JSON.stringify(data));
       return json({ error: data.error?.message || 'Anthropic API error' }, upstream.status);
     }
 
     return json(data);
 
   } catch (e) {
-    console.error('Proxy fetch error:', e);
+    console.error('Proxy fetch error:', e.message);
     return err('Failed to reach Anthropic API', 502);
   }
 }
 
 // ── KV: LOAD RESULTS ─────────────────────────────────────────
 async function handleLoadResults(env) {
+  if (!env.RESULTS) return json({ results: [] });
   try {
     const raw = await env.RESULTS.get(RESULTS_KV_KEY);
-    const results = raw ? JSON.parse(raw) : [];
-    return json({ results });
+    return json({ results: raw ? JSON.parse(raw) : [] });
   } catch (e) {
     console.error('KV load error:', e);
     return json({ results: [] });
@@ -137,28 +146,20 @@ async function handleLoadResults(env) {
 // ── KV: SAVE NEW RESULT ──────────────────────────────────────
 async function handleSaveResult(request, env) {
   let record;
-  try {
-    record = await request.json();
-  } catch {
-    return err('Invalid JSON body');
-  }
+  try { record = await request.json(); }
+  catch { return err('Invalid JSON body'); }
 
-  if (!record.teamA || !record.teamB) {
-    return err('teamA and teamB required');
-  }
-
-  // Assign ID if not present
+  if (!record.teamA || !record.teamB) return err('teamA and teamB required');
   if (!record.id) record.id = Date.now();
+
+  if (!env.RESULTS) return json({ success: true, id: record.id, total: 0 });
 
   try {
     const raw     = await env.RESULTS.get(RESULTS_KV_KEY);
     const results = raw ? JSON.parse(raw) : [];
     results.unshift(record);
-
-    // Cap at 200 results to keep KV value under 25MB
     const trimmed = results.slice(0, 200);
     await env.RESULTS.put(RESULTS_KV_KEY, JSON.stringify(trimmed));
-
     return json({ success: true, id: record.id, total: trimmed.length });
   } catch (e) {
     console.error('KV save error:', e);
@@ -168,6 +169,7 @@ async function handleSaveResult(request, env) {
 
 // ── KV: DELETE ONE RESULT ────────────────────────────────────
 async function handleDeleteResult(id, env) {
+  if (!env.RESULTS) return json({ success: true, remaining: 0 });
   try {
     const raw     = await env.RESULTS.get(RESULTS_KV_KEY);
     const results = raw ? JSON.parse(raw) : [];
@@ -182,6 +184,7 @@ async function handleDeleteResult(id, env) {
 
 // ── KV: CLEAR ALL RESULTS ────────────────────────────────────
 async function handleClearResults(env) {
+  if (!env.RESULTS) return json({ success: true });
   try {
     await env.RESULTS.put(RESULTS_KV_KEY, JSON.stringify([]));
     return json({ success: true });
