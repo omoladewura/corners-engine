@@ -1,12 +1,20 @@
 name = "corners-engine"
 main = "worker.js"
-compatibility_date = "2024-01-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2026-06-12"
+compatibility_flags = ["nodejs_compat_v2"]
 
+# Static assets (index.html etc.) served via Cloudflare Assets
 [assets]
 directory = "./public"
 
+# KV namespace for Adaptive Learning results tracker
+# The binding name "RESULTS" must match env.RESULTS in worker.js
 [[kv_namespaces]]
 binding    = "RESULTS"
 id         = "807606d270d64e2bb250792cc5ec638c"
 preview_id = "807606d270d64e2bb250792cc5ec638c"
+
+# ANTHROPIC_API_KEY must be set as a secret — never commit it here.
+# Run once after deploying:
+#   npx wrangler secret put ANTHROPIC_API_KEY
+# Then paste your key when prompted.
